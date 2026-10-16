@@ -1,0 +1,19 @@
+# Dependencias REALES para ejecutar la PoC completa con los 5 proveedores
+# (generate(): Gemini + OpenAI gpt-oss-20b/Groq + Llama 3.3/OpenRouter;
+# embed(): Gemini + AWS Bedrock Titan Embeddings V2 + Voyage AI — ver
+# EVALUACION_ATAM_LITE.md, hallazgo R-7, y src/config.py) + pgvector.
+# No están instaladas en el entorno donde se verificó la lógica (ver tests/ y README);
+# instálalas en tu máquina o en el paquete de despliegue de AWS Lambda.
+
+langchain-core>=0.2
+langchain-text-splitters>=0.2
+langchain-google-genai>=1.0.10   # Gemini (Google AI Studio, capa gratuita)
+langchain-openai>=0.1.20         # cliente compatible OpenAI, usado para Groq (gpt-oss-20b) y OpenRouter (Llama 3.3)
+langchain-postgres>=0.0.9        # PGVector sobre PostgreSQL
+psycopg[binary]>=3.1
+pgvector>=0.2.5
+python-dotenv>=1.0
+fastapi>=0.111
+uvicorn[standard]>=0.30
+boto3>=1.34                      # Secrets Manager / DynamoDB, y ahora también Bedrock Runtime (embed(), respaldo 1)
+requests>=2.31                   # cliente HTTP para Voyage AI (embed(), respaldo 2)

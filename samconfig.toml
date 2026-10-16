@@ -1,0 +1,14 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "javeriana-ia-poc"
+resolve_s3 = true
+s3_prefix = "javeriana-ia-poc"
+region = "us-east-2"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "VpcId=\"vpc-01ecbdbe698e18852\" SubnetIds=\"subnet-019365543d04c290f,subnet-04635958a8b9648c7\" DBAllowedCidr=\"0.0.0.0/0\" DBUsername=\"javeriana_app\" OpenAiOssBaseUrl=\"https://api.groq.com/openai/v1\" OpenAiOssModel=\"openai/gpt-oss-20b\" LlamaBaseUrl=\"https://openrouter.ai/api/v1\" GeminiModel=\"gemini-3.5-flash\" GeminiEmbeddingModel=\"models/gemini-embedding-001\" LlamaModel=\"meta-llama/llama-3.3-70b-instruct\" BedrockEmbeddingModelId=\"amazon.titan-embed-text-v2:0\" VoyageModel=\"voyage-4-lite\" VoyageBaseUrl=\"https://api.voyageai.com/v1\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-2"

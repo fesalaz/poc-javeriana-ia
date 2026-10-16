@@ -1,0 +1,9 @@
+{
+  "BudgetName": "javeriana-ia-poc-monthly-budget",
+  "BudgetLimit": {
+    "Amount": "15",
+    "Unit": "USD"
+  },
+  "TimeUnit": "MONTHLY",
+  "BudgetType": "COST"
+}

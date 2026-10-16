@@ -1,0 +1,18 @@
+# Levanta PostgreSQL con la extensión pgvector para pruebas/desarrollo local
+# de la Iteración 5 (Retrieval Service). En AWS se reemplaza por Amazon RDS
+# (ver infra/template.yaml e Iteración 3 del diseño: sin Multi-AZ en el free tier).
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: javeriana_ia
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

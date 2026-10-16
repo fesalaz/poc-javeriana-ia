@@ -1,0 +1,442 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  PoC "Asistente Javeriana IA" — despliegue de referencia en capa gratuita de AWS,
+  siguiendo la vista de despliegue documentada en las Iteraciones 1 y 3 del diseño
+  ADD 3.0 (arquitectura-add30-javeriana.md). No desplegado ni validado contra una
+  cuenta real de AWS en este entorno (sin credenciales) — revisar con `sam validate`
+  y `sam build` antes de `sam deploy`.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC donde se creará la base de datos (puede ser la VPC default).
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Al menos 2 subredes en distintas AZ (requerido por RDS DBSubnetGroup, aunque el PoC use una sola instancia sin Multi-AZ; ver Iteración 3, trade-off C5 vs QAS-D2).
+  DBAllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR permitido para conectarse a PostgreSQL. Para el PoC se deja abierto por
+      simplicidad (evita el costo de un NAT Gateway al no meter el Lambda en la VPC),
+      PERO esto es una concesión de seguridad SOLO aceptable en un PoC académico
+      temporal — en producción, restringir a security groups específicos o mover
+      todo a una VPC privada con NAT/VPC endpoints. Ver Iteración 7 (QAS-S2).
+  DBUsername:
+    Type: String
+    Default: javeriana_app
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+  GoogleApiKey:
+    Type: String
+    NoEcho: true
+    Description: API key gratuita de Google AI Studio (Gemini) — proveedor 1 (primario).
+  OpenAiOssApiKey:
+    Type: String
+    NoEcho: true
+    Description: API key gratuita de Groq, usada para el modelo openai/gpt-oss-20b — proveedor 2.
+  OpenAiOssBaseUrl:
+    Type: String
+    Default: https://api.groq.com/openai/v1
+  OpenAiOssModel:
+    Type: String
+    Default: openai/gpt-oss-20b
+  LlamaApiKey:
+    Type: String
+    NoEcho: true
+    Description: >-
+      API key de OpenRouter para Meta Llama 3.3 — proveedor 3. Usa el modelo
+      de PAGO (LlamaModel de abajo): el slug ":free" de este modelo dejó de
+      estar disponible en la práctica en OpenRouter (404 "This model is
+      unavailable for free"), aunque el catálogo web lo siga mostrando como
+      "Free". Requiere créditos cargados en la cuenta de OpenRouter. Ver
+      GUIA_DESPLIEGUE_Y_PRUEBAS.md sección 0.1.
+  LlamaBaseUrl:
+    Type: String
+    Default: https://openrouter.ai/api/v1
+  GeminiModel:
+    Type: String
+    Default: gemini-3.5-flash
+  GeminiEmbeddingModel:
+    Type: String
+    Default: models/gemini-embedding-001
+  LlamaModel:
+    Type: String
+    Default: meta-llama/llama-3.3-70b-instruct
+  BedrockEmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0
+    Description: >-
+      Respaldo 1 de embed() (septiembre 2026, hallazgo R-7 de
+      EVALUACION_ATAM_LITE.md). No requiere API key: usa el rol de ejecución
+      de QueryFunction (ver el permiso bedrock:InvokeModel más abajo).
+  VoyageApiKey:
+    Type: String
+    NoEcho: true
+    Description: >-
+      Respaldo 2 de embed() (Voyage AI, https://dash.voyageai.com/ — 200M
+      tokens gratis por cuenta). Proveedor independiente de AWS, para no
+      depender de un único cloud si Bedrock también tuviera una degradación.
+  VoyageModel:
+    Type: String
+    Default: voyage-4-lite
+  VoyageBaseUrl:
+    Type: String
+    Default: https://api.voyageai.com/v1
+
+Resources:
+
+  # ---------- Frontend (Cliente Web, ver Iteración 1) ----------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Nota: servir el bucket vía CloudFront (con Origin Access Control) en vez de
+      # sitio web público de S3 directo, para TLS y mejor alineación con QAS-S2.
+
+  # ---------- Autenticación institucional (QAS-S1, Iteración 1/7) ----------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: javeriana-ia-poc-users
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireUppercase: true
+          RequireNumbers: true
+      # Para producción: agregar AWS::Cognito::UserPoolIdentityProvider federando
+      # con el IdP institucional (SAML/OIDC de la Universidad Javeriana Cali).
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: javeriana-ia-poc-client
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # ---------- API Gateway explícita, con autorizador de Cognito (QAS-S1) ----------
+  # Antes esta API era implícita (SAM la creaba sola a partir de los eventos
+  # "Api" del QueryFunction, con el nombre lógico autogenerado
+  # "ServerlessRestApi"), y ninguna ruta tenía autorización: cualquiera con la
+  # URL podía invocar /query o /courses... sin ningún token. Se hace explícita
+  # acá SOLO para poder adjuntarle "Auth" (SAM no permite poner "Auth" sobre
+  # una API implícita) — el UserPool ya existía como recurso, pero no estaba
+  # conectado a ninguna ruta hasta ahora. DefaultAuthorizer aplica el mismo
+  # autorizador a las 6 rutas por defecto, sin tener que repetirlo en cada una.
+  #
+  # IMPORTANTE — qué SÍ y qué NO resuelve esto: esta autorización valida QUIÉN
+  # llama (JWT de Cognito válido y no expirado) — cierra la brecha de "la API
+  # está abierta a cualquiera en internet". NO valida QUÉ puede hacer ese
+  # usuario (p.ej. que un estudiante no pueda operar sobre un curso al que no
+  # está inscrito) — eso es el "Authorization Policy Engine" con RBAC sobre
+  # courseId que la Iteración 7 del documento de arquitectura describe como
+  # diseño y que sigue sin implementar en código (lambda_handler.py sigue
+  # confiando en el studentId/courseId que manda el cliente en el body, igual
+  # que antes). Ver GUIA_DESPLIEGUE_Y_PRUEBAS.md, sección 6.6.
+  JaverianaApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  # ---------- Caché KV para CAG (Iteración 1/5) ----------
+  CAGTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: javeriana-ia-cag-cache
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: course_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: course_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ---------- Secretos de proveedores LLM (QAS-S2, Iteración 7) ----------
+  LLMSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: javeriana-ia-poc/llm-provider-keys
+      Description: >-
+        Credenciales de los proveedores de generate() (Gemini, OpenAI
+        gpt-oss-20b/Groq, Llama 3.3/OpenRouter), de Voyage AI (respaldo 2 de
+        embed(), septiembre 2026 — ver R-7 en EVALUACION_ATAM_LITE.md) y la
+        contraseña de PostgreSQL. AWS Bedrock (respaldo 1 de embed()) NO
+        necesita credencial aquí: usa el rol de ejecución de QueryFunction.
+        lambda_handler.py lee este secreto en cada cold start
+        (_load_secrets_into_env(), genérico: vierte cada clave del JSON como
+        variable de entorno) y arma POSTGRES_URL con la contraseña
+        (_build_postgres_url()).
+      SecretString: !Sub |
+        {"GOOGLE_API_KEY":"${GoogleApiKey}","OPENAI_OSS_API_KEY":"${OpenAiOssApiKey}","LLAMA_API_KEY":"${LlamaApiKey}","VOYAGE_API_KEY":"${VoyageApiKey}","POSTGRES_PASSWORD":"${DBPassword}"}
+
+  # ---------- Persistencia relacional + vectorial (Iteración 1/3/5) ----------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subredes para la instancia RDS del PoC.
+      SubnetIds: !Ref SubnetIds
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Acceso a PostgreSQL del PoC (ver nota de DBAllowedCidr).
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref DBAllowedCidr
+
+  PostgresDB:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      Engine: postgres
+      # Solo versión mayor (sin minor): RDS retira versiones minor específicas
+      # con frecuencia (p.ej. "16.4" ya no existía al desplegar en agosto de
+      # 2026 — "Cannot find version 16.4 for postgres"). Con solo "16", RDS
+      # asigna automáticamente la minor vigente más reciente de esa serie
+      # (16.14 al momento de escribir esto). Esto genera un "drift" benigno
+      # en `sam diff`/detección de drift (CloudFormation compara "16" contra
+      # la minor real asignada) — no afecta el funcionamiento, ver
+      # GUIA_DESPLIEGUE_Y_PRUEBAS.md sección 10.
+      EngineVersion: "16"
+      DBInstanceClass: db.t3.micro   # elegible para capa gratuita (750h/mes, 12 meses)
+      AllocatedStorage: "20"          # límite de la capa gratuita
+      StorageType: gp2
+      DBName: javeriana_ia
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      PubliclyAccessible: true   # ver nota DBAllowedCidr: concesión solo para el PoC
+      MultiAZ: false              # Multi-AZ NO está en la capa gratuita (Iteración 3, C5 vs QAS-D2)
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+    # NOTA OPERATIVA: después de crear la instancia, conectarse y ejecutar
+    #   CREATE EXTENSION IF NOT EXISTS vector;
+    # (pgvector no se puede habilitar declarativamente desde CloudFormation).
+
+  # ---------- Orquestador + Adaptadores (monolito modular, Iteración 1 decisión D2) ----------
+  QueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: javeriana-ia-poc-query
+      Runtime: python3.13   # LTS, soportado por AWS Lambda hasta oct 2029 (ver GUIA sección 5.2)
+      Handler: lambda_handler.handler
+      CodeUri: ../             # raíz del proyecto (incluye requirements.txt); sam build instala dependencias
+      # 1024, no 512: los checkpoints de diagnóstico (ver GUIA sección 0.2)
+      # mostraron que build_provider_registry() por sí sola tarda ~18-20s de
+      # los 28s de Timeout disponibles — la hipótesis principal es que los
+      # imports de langchain-google-genai/langchain-openai (grpc, protobuf,
+      # openai, httpx) son CPU-bound y con 512 MB el Lambda solo recibe ~0.29
+      # vCPU (la CPU escala lineal con la memoria hasta 1792 MB = 1 vCPU
+      # completo). 1024 MB duplica esa CPU sin acercarse al techo de costo
+      # del proyecto (facturación = memoria x duración; si la duración baja
+      # proporcionalmente, el costo total no sube). Si los próximos logs
+      # muestran que el import sigue lento, el siguiente paso es subir a
+      # ~1792 MB (1 vCPU completo).
+      MemorySize: 1024
+      # 28s, no 30s: el API Gateway REST (creado implícitamente por el evento
+      # "Api" de abajo) tiene un tope de integración fijo de 29s que no se
+      # puede subir. Con Timeout=30 el Gateway devolvía 504 antes de que el
+      # propio Lambda pudiera terminar/reportar su error; con 28s el Lambda
+      # siempre "gana" la carrera y su error real (en vez de un 504 genérico)
+      # llega al cliente. Ver GUIA_DESPLIEGUE_Y_PRUEBAS.md, sección 0.1.
+      Timeout: 28
+      Environment:
+        Variables:
+          USE_REAL_LLM_PROVIDERS: "true"
+          # Tope por-llamada a cada proveedor LLM (segundos), aplicado como
+          # timeout de PARED por ProviderRegistry (src/registry/provider_registry.py),
+          # no solo como parámetro del cliente de cada adaptador: se confirmó
+          # en CloudWatch Logs que ChatGoogleGenerativeAI no respetaba su
+          # propio `timeout=` (colgado hasta agotar los 28s completos del
+          # Lambda, 3 veces seguidas). Con 6s x hasta 4 intentos en el peor
+          # caso por consulta (1 de embed() + 3 de generate()) quedan ~4s de
+          # margen dentro del Timeout de 28s para el resto del pipeline.
+          LLM_REQUEST_TIMEOUT_SECONDS: "6"
+          GEMINI_MODEL: !Ref GeminiModel
+          GEMINI_EMBEDDING_MODEL: !Ref GeminiEmbeddingModel
+          OPENAI_OSS_MODEL: !Ref OpenAiOssModel
+          OPENAI_OSS_BASE_URL: !Ref OpenAiOssBaseUrl
+          LLAMA_MODEL: !Ref LlamaModel
+          LLAMA_BASE_URL: !Ref LlamaBaseUrl
+          # Respaldo 1 de embed() (septiembre 2026, hallazgo R-7). Sin API
+          # key: BedrockEmbeddingAdapter usa el rol de ejecución de esta
+          # misma función (ver permiso bedrock:InvokeModel en Policies).
+          BEDROCK_EMBEDDING_MODEL_ID: !Ref BedrockEmbeddingModelId
+          # Respaldo 2 de embed(). VOYAGE_API_KEY llega vía LLMSecrets
+          # (_load_secrets_into_env() la vierte como variable de entorno).
+          VOYAGE_MODEL: !Ref VoyageModel
+          VOYAGE_BASE_URL: !Ref VoyageBaseUrl
+          SECRETS_ARN: !Ref LLMSecrets
+          DYNAMO_TABLE_NAME: !Ref CAGTable
+          POSTGRES_HOST: !GetAtt PostgresDB.Endpoint.Address
+          POSTGRES_PORT: !GetAtt PostgresDB.Endpoint.Port
+          POSTGRES_DB: javeriana_ia
+          POSTGRES_USER: !Ref DBUsername
+          # Evita que una conexión a RDS colgada (regla de seguridad,
+          # instancia aún inicializando) bloquee la construcción del
+          # Orquestador sin límite — hang real detectado en el PoC
+          # desplegado, ocurría ANTES de llegar a los proveedores LLM (el
+          # timeout de pared de ProviderRegistry no cubre este paso).
+          POSTGRES_CONNECT_TIMEOUT_SECONDS: "5"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CAGTable
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref LLMSecrets
+        # Respaldo 1 de embed() (septiembre 2026, hallazgo R-7): BedrockEmbeddingAdapter
+        # invoca este modelo con las credenciales del propio rol de ejecución
+        # de Lambda — sin este permiso, la llamada falla con AccessDenied (una
+        # falla real de proveedor, no un NotImplementedError, así que sí
+        # abriría su circuit breaker). El ARN de un modelo base de Bedrock no
+        # incluye el Account ID de la cuenta.
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockEmbeddingModelId}"
+      Events:
+        # RestApiId: !Ref JaverianaApi en las 6 rutas — sin esto, SAM volvería a
+        # crear una API implícita SIN autorización en paralelo a JaverianaApi
+        # (sería fácil dejar una ruta desprotegida por accidente si se olvida
+        # en alguna). Todas apuntan a la misma API explícita de arriba, así
+        # que las 6 heredan el DefaultAuthorizer de Cognito.
+        QueryApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JaverianaApi
+            Path: /query
+            Method: post
+        # ---------- FR5: gestión de cursos y recursos (mismo Lambda, D2) ----------
+        # Todas viven en la misma función (monolito modular, ver decisión D2 en
+        # arquitectura-add30-javeriana.md) y comparten el vector_store/cag_store/
+        # embedding_provider ya construidos para /query — publicar material aquí
+        # dispara la misma ingesta RAG + precarga CAG (ver lambda_handler.py).
+        CreateCourseApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JaverianaApi
+            Path: /courses
+            Method: post
+        ListCoursesApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JaverianaApi
+            Path: /courses
+            Method: get
+        AssignTeacherApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JaverianaApi
+            Path: /courses/{courseId}/teachers
+            Method: post
+        EnrollStudentApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JaverianaApi
+            Path: /courses/{courseId}/students
+            Method: post
+        PublishMaterialApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref JaverianaApi
+            Path: /courses/{courseId}/material
+            Method: post
+
+  # ---------- Observabilidad (Iteración 3) ----------
+  QueryFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Errores del Orquestador — insumo de disponibilidad (QAS-D1/D3).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref QueryFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  QueryFunctionLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Latencia alta del Orquestador — insumo de desempeño (QAS-P1/P3).
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref QueryFunction
+      # Los percentiles (p95, p99, etc.) van en ExtendedStatistic, no en
+      # Statistic — este último solo acepta Maximum/SampleCount/Sum/Minimum/
+      # Average (CloudFormation rechaza "p95" ahí con un error de validación).
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 8000   # 8s, umbral de degradación aceptable definido en QAS-P3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiUrl:
+    Description: >
+      URL del endpoint POST /query (API Gateway). Requiere un JWT de Cognito
+      válido en el header Authorization: Bearer <token> — ver
+      GUIA_DESPLIEGUE_Y_PRUEBAS.md, sección 6.6, para obtenerlo.
+    Value: !Sub "https://${JaverianaApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/query"
+  ApiBaseUrl:
+    Description: >
+      URL base de la API (sin /query) — a partir de acá cuelgan también las
+      rutas de gestión de cursos (FR5): POST /courses, GET /courses?userId=...,
+      POST /courses/{courseId}/teachers, POST /courses/{courseId}/students,
+      POST /courses/{courseId}/material. Las 6 rutas (esta base + /query)
+      requieren el mismo header Authorization: Bearer <token> de Cognito. Ver
+      GUIA_DESPLIEGUE_Y_PRUEBAS.md, secciones 6.5 y 6.6.
+    Value: !Sub "https://${JaverianaApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  UserPoolId:
+    Description: Úsalo para crear usuarios de prueba (ver GUIA sección 6.6).
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: ClientId para autenticar (aws cognito-idp initiate-auth) y obtener el token.
+    Value: !Ref UserPoolClient
+  CAGTableName:
+    Value: !Ref CAGTable
+  PostgresEndpoint:
+    Value: !GetAtt PostgresDB.Endpoint.Address
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  LLMSecretsArn:
+    Value: !Ref LLMSecrets
